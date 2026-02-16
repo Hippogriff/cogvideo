@@ -106,30 +106,60 @@ def sdedit(
         # But pipe.vae.encode usually handles tensor input or we use pipe's method?
         # We'll valid manual encoding similar to video.
         
+    # Handle I2V Image Conditioning
+    image_latents = None
+    if is_i2v:
+        if image_cond_path is None:
+            raise ValueError("image_cond_path is required for I2V models")
+        
+        logging.info(f"Loading conditioning image from {image_cond_path}...")
+        image_cond = load_image(image_cond_path)
+        
         # Preprocess image
         image_cond = image_cond.resize((width, height))
         transform = T.Lambda(lambda x: x / 255.0 * 2.0 - 1.0)
         # Convert PIL to tensor
         image_cond_tensor = T.ToTensor()(image_cond) # [C, H, W] -> [0,1]
-        image_cond_tensor = transform(image_cond_tensor * 255.0) # Back to [-1, 1] logic?
-        # Actually T.ToTensor gives [0,1].
-        # transform: x -> x * 2.0 - 1.0 for [0, 1] input
+        
+        # Normalize to [-1, 1]
         image_cond_tensor = image_cond_tensor * 2.0 - 1.0
         
-        image_cond_tensor = image_cond_tensor.unsqueeze(0).unsqueeze(2) # [B, C, F, H, W] -> [1, 3, 1, H, W]
+        # encode_video_frames expects [F, C, H, W]
+        # We have [C, H, W], so unsqueeze(0) to get [1, C, H, W]
+        image_cond_tensor = image_cond_tensor.unsqueeze(0)
+        
         image_cond_tensor = image_cond_tensor.to(device=pipe.device, dtype=pipe.dtype)
         
         with torch.no_grad():
-            from diffusers.models.autoencoders import AutoencoderKLCogVideoX
-            # Use the same VAE
-            # encode_video_frames expects [B, C, F, H, W]
-            # output is [B, C, F, H, W] scaled
-            image_latents = encode_video_frames(pipe.vae, image_cond_tensor) 
+            # encode_video_frames returns [B, C, F, H, W] * scaling_factor
+            # But wait, our local encode_video_frames returns [B, F, C, H, W]? 
+            # Let's check local definition. 
+            # Local encode_video_frames:
+            # video_frames = video_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+            # latent_dist = vae.encode(x=video_frames).latent_dist.sample().transpose(1, 2) # [B, F, C, H, W]
+            # return latent_dist * vae.config.scaling_factor
             
-            # Repeat image latents to match video latents length
-            # video latents: [B, C, F_vid, H_lat, W_lat]
-            # image latents: [B, C, 1, H_lat, W_lat]
-            image_latents = image_latents.repeat(1, 1, latents.shape[2], 1, 1)
+            # So image_latents will be [B, 1, C, H, W]
+            image_latents = encode_video_frames(pipe.vae, image_cond_tensor) 
+
+            # Official Pipeline Logic for Padding
+            # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/cogvideo/pipeline_cogvideox_image2video.py#L427
+            
+            # We need to pad image_latents to match video latents length
+            # video latents: [B, F, C, H, W]
+            # image latents: [B, 1, C, H, W]
+            
+            padding_shape = (
+                latents.shape[0], # Batch
+                latents.shape[1] - 1, # Num frames - 1
+                latents.shape[2], # Channels
+                latents.shape[3], # Height
+                latents.shape[4], # Width
+            )
+            
+            latent_padding = torch.zeros(padding_shape, device=device, dtype=dtype)
+            image_latents = torch.cat([image_latents, latent_padding], dim=1) # Concatenate along frames
+
 
     
     # 3. Add Noise (Forward Diffusion)
@@ -202,10 +232,11 @@ def sdedit(
             
             # Handle I2V Concatenation
             if is_i2v and image_latents is not None:
-                # image_latents: [1, C, F, H, W]
-                # latent_model_input: [2, C, F, H, W] (if CFG)
+                # image_latents: [B, F, C, H, W]
+                # latent_model_input: [2B, F, C, H, W] (if CFG)
                 image_latents_input = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
-                latent_model_input = torch.cat([latent_model_input, image_latents_input], dim=1)
+                # Concatenate along CHANNEL dimension (dim=2)
+                latent_model_input = torch.cat([latent_model_input, image_latents_input], dim=2)
 
             # Predict noise
             # Broadcast timestep
