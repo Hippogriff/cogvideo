@@ -64,11 +64,17 @@ def sdedit(
     dtype: torch.dtype = torch.bfloat16,
     seed: int = 42,
     device: str = "cuda",
+    debug_sdedit: bool = False,
+    image_cond_path: Optional[str] = None,
 ):
     # 1. Load Pipeline
-    # We use CogVideoXPipeline because it has the Transformer and VAE.
-    # We will implement the loop manually.
-    pipe = CogVideoXPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
+    is_i2v = "i2v" in model_path.lower()
+    if is_i2v:
+        logging.info("Detected Image-to-Video model.")
+        from diffusers import CogVideoXImageToVideoPipeline
+        pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
+    else:
+        pipe = CogVideoXPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
     
     # Enable optimizations
     # pipe.enable_sequential_cpu_offload()
@@ -86,6 +92,45 @@ def sdedit(
     logging.info(f"Encoding video frames... Shape: {video_frames.shape}")
     with torch.no_grad():
         latents = encode_video_frames(pipe.vae, video_frames)
+
+    # Handle I2V Image Conditioning
+    image_latents = None
+    if is_i2v:
+        if image_cond_path is None:
+            raise ValueError("image_cond_path is required for I2V models")
+        
+        logging.info(f"Loading conditioning image from {image_cond_path}...")
+        image_cond = load_image(image_cond_path)
+        # Resize image to match video width/height if needed? 
+        # For now assume load_image gives PIL, we might need to resize.
+        # But pipe.vae.encode usually handles tensor input or we use pipe's method?
+        # We'll valid manual encoding similar to video.
+        
+        # Preprocess image
+        image_cond = image_cond.resize((width, height))
+        transform = T.Lambda(lambda x: x / 255.0 * 2.0 - 1.0)
+        # Convert PIL to tensor
+        image_cond_tensor = T.ToTensor()(image_cond) # [C, H, W] -> [0,1]
+        image_cond_tensor = transform(image_cond_tensor * 255.0) # Back to [-1, 1] logic?
+        # Actually T.ToTensor gives [0,1].
+        # transform: x -> x * 2.0 - 1.0 for [0, 1] input
+        image_cond_tensor = image_cond_tensor * 2.0 - 1.0
+        
+        image_cond_tensor = image_cond_tensor.unsqueeze(0).unsqueeze(2) # [B, C, F, H, W] -> [1, 3, 1, H, W]
+        image_cond_tensor = image_cond_tensor.to(device=pipe.device, dtype=pipe.dtype)
+        
+        with torch.no_grad():
+            from diffusers.models.autoencoders import AutoencoderKLCogVideoX
+            # Use the same VAE
+            # encode_video_frames expects [B, C, F, H, W]
+            # output is [B, C, F, H, W] scaled
+            image_latents = encode_video_frames(pipe.vae, image_cond_tensor) 
+            
+            # Repeat image latents to match video latents length
+            # video latents: [B, C, F_vid, H_lat, W_lat]
+            # image latents: [B, C, 1, H_lat, W_lat]
+            image_latents = image_latents.repeat(1, 1, latents.shape[2], 1, 1)
+
     
     # 3. Add Noise (Forward Diffusion)
     # Schedule setup
@@ -111,7 +156,16 @@ def sdedit(
     noise = torch.randn(latents.shape, generator=generator, device=device, dtype=latents.dtype)
     
     latents_noisy = pipe.scheduler.add_noise(latents, noise, timestep.unsqueeze(0))
-    
+
+    if debug_sdedit:
+        logging.info("Saving debug video (noisy input)...")
+        with torch.no_grad():
+            debug_video = pipe.decode_latents(latents_noisy)
+            debug_frames = pipe.video_processor.postprocess_video(video=debug_video, output_type="pil")
+        debug_output_path = output_path.replace(".mp4", "_debug_noisy.mp4")
+        export_to_video(video_frames=debug_frames[0], output_video_path=debug_output_path, fps=fps)
+        logging.info(f"Saved debug video to {debug_output_path}")
+
     # 4. Denoise (Reverse Diffusion)
     
     # Encode prompt
@@ -146,6 +200,13 @@ def sdedit(
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, t)
             
+            # Handle I2V Concatenation
+            if is_i2v and image_latents is not None:
+                # image_latents: [1, C, F, H, W]
+                # latent_model_input: [2, C, F, H, W] (if CFG)
+                image_latents_input = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
+                latent_model_input = torch.cat([latent_model_input, image_latents_input], dim=1)
+
             # Predict noise
             # Broadcast timestep
             timestep_tensor = t.expand(latent_model_input.shape[0])
@@ -191,6 +252,8 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"], help="Precision")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--max_num_frames", type=int, default=81, help="Max frames to process")
+    parser.add_argument("--debug_sdedit", action="store_true", help="Save debug videos (noisy input)")
+    parser.add_argument("--image_cond_path", type=str, default=None, help="Path to conditioning image for I2V")
     
     args = parser.parse_args()
     
@@ -209,5 +272,7 @@ if __name__ == "__main__":
         fps=args.fps,
         dtype=dtype,
         seed=args.seed,
-        max_num_frames=args.max_num_frames
+        max_num_frames=args.max_num_frames,
+        debug_sdedit=args.debug_sdedit,
+        image_cond_path=args.image_cond_path
     )
