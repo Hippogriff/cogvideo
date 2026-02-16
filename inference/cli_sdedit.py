@@ -47,7 +47,11 @@ def encode_video_frames(vae, video_frames: torch.FloatTensor) -> torch.FloatTens
     video_frames = video_frames.to(device=vae.device, dtype=vae.dtype)
     video_frames = video_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
     latent_dist = vae.encode(x=video_frames).latent_dist.sample().transpose(1, 2)
-    return latent_dist * vae.config.scaling_factor
+    
+    if hasattr(vae.config, "invert_scale_latents") and vae.config.invert_scale_latents:
+         return latent_dist / vae.config.scaling_factor
+    else:
+         return latent_dist * vae.config.scaling_factor
 
 def sdedit(
     prompt: str,
@@ -101,23 +105,9 @@ def sdedit(
         
         logging.info(f"Loading conditioning image from {image_cond_path}...")
         image_cond = load_image(image_cond_path)
-        # Resize image to match video width/height if needed? 
-        # For now assume load_image gives PIL, we might need to resize.
-        # But pipe.vae.encode usually handles tensor input or we use pipe's method?
-        # We'll valid manual encoding similar to video.
-        
-    # Handle I2V Image Conditioning
-    image_latents = None
-    if is_i2v:
-        if image_cond_path is None:
-            raise ValueError("image_cond_path is required for I2V models")
-        
-        logging.info(f"Loading conditioning image from {image_cond_path}...")
-        image_cond = load_image(image_cond_path)
         
         # Preprocess image
         image_cond = image_cond.resize((width, height))
-        transform = T.Lambda(lambda x: x / 255.0 * 2.0 - 1.0)
         # Convert PIL to tensor
         image_cond_tensor = T.ToTensor()(image_cond) # [C, H, W] -> [0,1]
         
@@ -131,24 +121,9 @@ def sdedit(
         image_cond_tensor = image_cond_tensor.to(device=pipe.device, dtype=pipe.dtype)
         
         with torch.no_grad():
-            # encode_video_frames returns [B, C, F, H, W] * scaling_factor
-            # But wait, our local encode_video_frames returns [B, F, C, H, W]? 
-            # Let's check local definition. 
-            # Local encode_video_frames:
-            # video_frames = video_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-            # latent_dist = vae.encode(x=video_frames).latent_dist.sample().transpose(1, 2) # [B, F, C, H, W]
-            # return latent_dist * vae.config.scaling_factor
-            
-            # So image_latents will be [B, 1, C, H, W]
             image_latents = encode_video_frames(pipe.vae, image_cond_tensor) 
 
-            # Official Pipeline Logic for Padding
-            # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/cogvideo/pipeline_cogvideox_image2video.py#L427
-            
-            # We need to pad image_latents to match video latents length
-            # video latents: [B, F, C, H, W]
-            # image latents: [B, 1, C, H, W]
-            
+            # Match padding logic from pipeline
             padding_shape = (
                 latents.shape[0], # Batch
                 latents.shape[1] - 1, # Num frames - 1
@@ -157,8 +132,10 @@ def sdedit(
                 latents.shape[4], # Width
             )
             
+            
             latent_padding = torch.zeros(padding_shape, device=device, dtype=dtype)
             image_latents = torch.cat([image_latents, latent_padding], dim=1) # Concatenate along frames
+
 
 
     
@@ -223,6 +200,11 @@ def sdedit(
         else None
     )
 
+    # Create ofs embeds if required
+    ofs_emb = None
+    if pipe.transformer.config.ofs_embed_dim is not None:
+        ofs_emb = latents.new_full((1,), fill_value=2.0)
+
     logging.info("Starting denoising loop...")
     with torch.no_grad():
         for i, t in enumerate(remaining_timesteps):
@@ -247,6 +229,7 @@ def sdedit(
                 encoder_hidden_states=prompt_embeds,
                 timestep=timestep_tensor,
                 image_rotary_emb=image_rotary_emb,
+                ofs=ofs_emb,
                 return_dict=False,
             )[0]
             
