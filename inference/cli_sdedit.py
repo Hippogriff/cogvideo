@@ -1,15 +1,19 @@
+import os
+os.environ["HF_HOME"] = "/group-volume/gopalsharma/"
 import argparse
 import logging
 import math
-import os
 from typing import Optional, List, Union
 
 import torch
 import torch.nn.functional as F
-from diffusers import CogVideoXPipeline, CogVideoXDPMScheduler
-from diffusers.utils import export_to_video, load_video, load_image
-import decord
 import torchvision.transforms as T
+import decord
+from diffusers import CogVideoXPipeline, CogVideoXDPMScheduler, CogVideoXImageToVideoPipeline
+from diffusers.utils import export_to_video, load_video, load_image
+
+# Set HF_HOME if not already set, but user explicitly added this so we keep it.
+os.environ["HF_HOME"] = "/group-volume/gopalsharma/"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -75,27 +79,48 @@ def sdedit(
     is_i2v = "i2v" in model_path.lower()
     if is_i2v:
         logging.info("Detected Image-to-Video model.")
-        from diffusers import CogVideoXImageToVideoPipeline
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
     else:
         pipe = CogVideoXPipeline.from_pretrained(model_path, torch_dtype=dtype).to(device)
     
+    generator = torch.Generator(device=device).manual_seed(seed)
+    
     # Enable optimizations
-    # pipe.enable_sequential_cpu_offload()
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
     
+    # Calculate required frames including padding for patch_size_t
+    num_frames = max_num_frames
+    # For CogVideoX 1.5, the latent frames should be padded to make it divisible by patch_size_t
+    patch_size_t = getattr(pipe.transformer.config, "patch_size_t", None)
+    additional_frames = 0
+    latent_frames = (num_frames - 1) // pipe.vae_scale_factor_temporal + 1
+    
+    if patch_size_t is not None and latent_frames % patch_size_t != 0:
+        additional_frames = patch_size_t - latent_frames % patch_size_t
+        num_frames += additional_frames * pipe.vae_scale_factor_temporal
+
     # 2. Load and Encode Input Video
     logging.info(f"Loading video from {video_path}...")
     try:
-        video_frames = get_video_frames(video_path, width, height, max_num_frames)
+        video_frames = get_video_frames(video_path, width, height, num_frames)
     except Exception as e:
         logging.error(f"Error loading video: {e}")
         return
 
     logging.info(f"Encoding video frames... Shape: {video_frames.shape}")
+    
     with torch.no_grad():
         latents = encode_video_frames(pipe.vae, video_frames)
+        # Pad latents if they have an odd number of frames (specific user workaround)
+        if latents.shape[1] % 2 == 1:
+            add_latents = torch.randn(
+                (1, latents.shape[1] % 2, latents.shape[2], latents.shape[3], latents.shape[4]), 
+                generator=generator, 
+                device=device, 
+                dtype=latents.dtype
+            )
+            latents = torch.cat([latents, add_latents], 1)
 
     # Handle I2V Image Conditioning
     image_latents = None
@@ -108,6 +133,7 @@ def sdedit(
         
         # Preprocess image
         image_cond = image_cond.resize((width, height))
+        
         # Convert PIL to tensor
         image_cond_tensor = T.ToTensor()(image_cond) # [C, H, W] -> [0,1]
         
@@ -132,13 +158,9 @@ def sdedit(
                 latents.shape[4], # Width
             )
             
-            
             latent_padding = torch.zeros(padding_shape, device=device, dtype=dtype)
             image_latents = torch.cat([image_latents, latent_padding], dim=1) # Concatenate along frames
 
-
-
-    
     # 3. Add Noise (Forward Diffusion)
     # Schedule setup
     pipe.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -151,7 +173,7 @@ def sdedit(
     # Handle edge case where we don't do any steps
     if t_start_idx >= num_inference_steps:
          logging.info("Strength is too low, no denoising will be performed.")
-         return 
+         t_start_idx = num_inference_steps - 1
 
     timestep = timesteps[t_start_idx]
     remaining_timesteps = timesteps[t_start_idx:]
@@ -159,9 +181,7 @@ def sdedit(
     logging.info(f"Strength {strength} -> Starting from timestep {timestep.item()} (index {t_start_idx}). Total steps: {len(remaining_timesteps)}")
 
     # Add noise
-    generator = torch.Generator(device=device).manual_seed(seed)
     noise = torch.randn(latents.shape, generator=generator, device=device, dtype=latents.dtype)
-    
     latents_noisy = pipe.scheduler.add_noise(latents, noise, timestep.unsqueeze(0))
 
     if debug_sdedit:
